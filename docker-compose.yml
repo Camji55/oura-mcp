@@ -30,7 +30,9 @@ services:
       - source: oura_requirements
         target: /app/requirements.txt
     ports:
-      - "${OURA_MCP_PORT:-8000}:8000"
+      # Loopback-only by default; set OURA_MCP_BIND=0.0.0.0 only if your
+      # reverse proxy / tunnel runs on a different machine.
+      - "${OURA_MCP_BIND:-127.0.0.1}:${OURA_MCP_PORT:-8000}:8000"
     volumes:
       - pip-cache:/root/.cache/pip
     mem_limit: 256m
@@ -46,9 +48,10 @@ services:
         - CMD
         - python
         - -c
-        - import httpx,sys; sys.exit(0 if
+        - import httpx,os,sys; sys.exit(0 if
           httpx.get('http://127.0.0.1:8000/health',
-          timeout=5).json().get('status')=='ok' else 1)
+          headers={'Authorization':'Bearer '+os.environ['MCP_AUTH_TOKEN']},
+          timeout=5).json().get('oura_api') else 1)
       interval: 60s
       timeout: 10s
       retries: 3
@@ -72,7 +75,8 @@ configs:
 
       Env:
           OURA_ACCESS_TOKEN   Personal access token from cloud.ouraring.com
-          MCP_AUTH_TOKEN      Token for /mcp/<token> path auth (unset = no auth)
+          MCP_AUTH_TOKEN      Required. Auth token for /mcp/<token> or Bearer
+                              header; the server refuses to start without it.
           OURA_TIMEOUT        Request timeout seconds (default 30)
 
       Run:
@@ -104,9 +108,16 @@ configs:
 
       OURA_TOKEN = os.environ.get("OURA_ACCESS_TOKEN", "")
 
-      AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN")
+      AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
       TIMEOUT = int(os.environ.get("OURA_TIMEOUT", "30"))
+
+
+      if not AUTH_TOKEN:
+          raise SystemExit(
+              "MCP_AUTH_TOKEN is not set; refusing to start unauthenticated. "
+              "Set it to a long random string, e.g. from `openssl rand -hex 32`."
+          )
 
 
       mcp = FastMCP("oura")
@@ -168,8 +179,14 @@ configs:
       @mcp.custom_route("/health", methods=["GET"])
 
       async def health(request):
-          # Cached so unauthenticated hits can't be used to burn Oura API quota:
-          # at most one upstream call per _HEALTH_TTL_S regardless of traffic.
+          # Anonymous callers get process liveness only. Oura connectivity
+          # detail reveals whether the token is currently valid, so it
+          # requires auth.
+          auth_header = request.headers.get("authorization", "")
+          if not (auth_header.startswith("Bearer ") and _token_ok(auth_header[7:])):
+              return JSONResponse({"status": "ok"})
+          # Cached: at most one upstream call per _HEALTH_TTL_S regardless of
+          # traffic.
           now = time.monotonic()
           if _health_cache["ts"] is None or now - _health_cache["ts"] >= _HEALTH_TTL_S:
               try:
@@ -586,16 +603,13 @@ configs:
           Accepts:
             - POST /mcp/<token>  (for Claude.ai connectors)
             - POST /mcp with Authorization: Bearer <token>  (for Claude Code CLI)
-            - GET /health  (always open, no auth)
+            - GET /health  (open; liveness only unless a valid Bearer token is sent)
           """
 
           async def dispatch(self, request, call_next):
               path = request.url.path
 
               if path == "/health":
-                  return await call_next(request)
-
-              if not AUTH_TOKEN:
                   return await call_next(request)
 
               if path.startswith("/mcp/"):

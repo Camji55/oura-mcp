@@ -58,8 +58,8 @@ Date-range tools default to the last 7 days when called without arguments.
    ```
 
    First start takes ~30s while pip installs dependencies (cached in a volume
-   afterwards). The server listens on port 8000; override with `OURA_MCP_PORT`
-   in `.env`.
+   afterwards). The server listens on `127.0.0.1:8000`; override with
+   `OURA_MCP_PORT` / `OURA_MCP_BIND` in `.env`.
 
 4. Check health:
 
@@ -67,8 +67,15 @@ Date-range tools default to the last 7 days when called without arguments.
    curl http://localhost:8000/health
    ```
 
-   `{"status": "ok", "oura_api": true}` means the server is up and your Oura
-   token works.
+   `{"status": "ok"}` means the server is up. To also verify your Oura token
+   works, authenticate the same endpoint:
+
+   ```bash
+   source .env && curl -H "Authorization: Bearer $MCP_AUTH_TOKEN" http://localhost:8000/health
+   ```
+
+   `{"status": "ok", "oura_api": true}` means the server can reach the Oura
+   API with your token.
 
 ## Connecting Claude
 
@@ -95,6 +102,7 @@ Compose:
 | `MCP_AUTH_TOKEN` | yes | Secret gating all `/mcp` requests (path segment or Bearer header) |
 | `OURA_TIMEOUT` | no | Oura API request timeout in seconds (default `30`) |
 | `OURA_MCP_PORT` | no | Host port the server is published on (default `8000`) |
+| `OURA_MCP_BIND` | no | Host interface to bind (default `127.0.0.1`; set `0.0.0.0` to expose beyond this machine) |
 
 Compose fails fast with a clear error if either required variable is missing.
 
@@ -105,9 +113,15 @@ Compose fails fast with a clear error if either required variable is missing.
   proxy (Caddy, nginx, Cloudflare Tunnel, Tailscale) before exposing it to the
   internet. Path-based tokens can also end up in proxy access logs — treat
   those logs as sensitive.
-- `/health` is intentionally unauthenticated; it reveals only whether the Oura
-  API is reachable, never data. The upstream check is cached for 60 seconds so
-  anonymous traffic can't be used to burn your Oura API quota.
+- The published port binds `127.0.0.1` by default, so nothing is exposed
+  beyond the machine unless you deliberately set `OURA_MCP_BIND=0.0.0.0`.
+- There is no unauthenticated mode: the server refuses to start if
+  `MCP_AUTH_TOKEN` is unset.
+- `/health` answers anonymous callers with process liveness only
+  (`{"status": "ok"}`). The Oura connectivity detail — which would reveal
+  whether your token is currently valid — requires the auth token, and the
+  upstream check behind it is cached for 60 seconds so it can't be used to
+  burn your Oura API quota.
 - Auth token comparison is constant-time (`hmac.compare_digest`), so response
   timing leaks nothing about the token.
 - Dependencies are pinned to exact versions in an embedded lockfile
