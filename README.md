@@ -58,7 +58,8 @@ Date-range tools default to the last 7 days when called without arguments.
    ```
 
    First start takes ~30s while pip installs dependencies (cached in a volume
-   afterwards). The server listens on port 8000.
+   afterwards). The server listens on port 8000; override with `OURA_MCP_PORT`
+   in `.env`.
 
 4. Check health:
 
@@ -93,6 +94,7 @@ Compose:
 | `OURA_ACCESS_TOKEN` | yes | Oura personal access token |
 | `MCP_AUTH_TOKEN` | yes | Secret gating all `/mcp` requests (path segment or Bearer header) |
 | `OURA_TIMEOUT` | no | Oura API request timeout in seconds (default `30`) |
+| `OURA_MCP_PORT` | no | Host port the server is published on (default `8000`) |
 
 Compose fails fast with a clear error if either required variable is missing.
 
@@ -104,7 +106,13 @@ Compose fails fast with a clear error if either required variable is missing.
   internet. Path-based tokens can also end up in proxy access logs — treat
   those logs as sensitive.
 - `/health` is intentionally unauthenticated; it reveals only whether the Oura
-  API is reachable, never data.
+  API is reachable, never data. The upstream check is cached for 60 seconds so
+  anonymous traffic can't be used to burn your Oura API quota.
+- Auth token comparison is constant-time (`hmac.compare_digest`), so response
+  timing leaks nothing about the token.
+- Dependencies are pinned to exact versions in an embedded lockfile
+  (`oura_requirements` in the compose file), so every container start installs
+  the same audited package set. To upgrade: bump the pins, recreate, re-audit.
 - Keep `.env` out of version control (already covered by `.gitignore`). If a
   token leaks, revoke it at cloud.ouraring.com and generate a new
   `MCP_AUTH_TOKEN`.
@@ -114,8 +122,9 @@ Compose fails fast with a clear error if either required variable is missing.
 ## How it works
 
 `docker-compose.yml` starts a stock `python:3.12-slim` container, installs
-[FastMCP](https://github.com/jlowin/fastmcp), httpx, and uvicorn at boot, and
-runs the embedded `oura_server.py` (injected via Compose `configs`). Auth is a
+[FastMCP](https://github.com/jlowin/fastmcp), httpx, and uvicorn from the
+embedded lockfile at boot, and runs the embedded `oura_server.py` (both
+injected via Compose `configs`). Auth is a
 small Starlette middleware that accepts either `POST /mcp/<token>` (claude.ai)
 or `POST /mcp` with a Bearer header (Claude Code), and the Oura client
 transparently follows `next_token` pagination.

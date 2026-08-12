@@ -1,5 +1,7 @@
 # Oura MCP server — single-file deployment.
-# Everything is embedded: no Dockerfile, no separate Python file.
+# Everything is embedded: no Dockerfile, no separate Python file, and the
+# dependency lockfile is inlined below (`oura_requirements`) so every
+# container start installs the exact same audited package versions.
 # Requires Docker Compose v2.23+ (for inline `configs.content`).
 #
 # 1. cp .env.example .env and fill in the two tokens.
@@ -15,7 +17,7 @@ services:
     working_dir: /app
     command: >
       sh -c "pip install --no-cache-dir --root-user-action=ignore
-      'fastmcp>=2,<3' 'httpx>=0.27,<1' 'uvicorn>=0.30,<1' && exec uvicorn
+      -r /app/requirements.txt && exec uvicorn
       oura_server:app --host 0.0.0.0 --port 8000"
     environment:
       # Values come from .env (see .env.example). `:?` fails fast if unset.
@@ -25,8 +27,10 @@ services:
     configs:
       - source: oura_server_py
         target: /app/oura_server.py
+      - source: oura_requirements
+        target: /app/requirements.txt
     ports:
-      - 8000:8000
+      - "${OURA_MCP_PORT:-8000}:8000"
     volumes:
       - pip-cache:/root/.cache/pip
     mem_limit: 256m
@@ -76,7 +80,11 @@ configs:
       """
 
 
+      import hmac
+
       import os
+
+      import time
 
       from datetime import date, timedelta
 
@@ -151,18 +159,31 @@ configs:
 
 
 
+      _HEALTH_TTL_S = 60
+
+
+      _health_cache: dict = {"ts": None, "ok": False}
+
+
       @mcp.custom_route("/health", methods=["GET"])
 
       async def health(request):
-          try:
-              resp = httpx.get(
-                  f"{OURA_BASE}/personal_info",
-                  headers={"Authorization": f"Bearer {OURA_TOKEN}"},
-                  timeout=5,
-              )
-              ok = resp.status_code == 200
-          except httpx.HTTPError:
-              ok = False
+          # Cached so unauthenticated hits can't be used to burn Oura API quota:
+          # at most one upstream call per _HEALTH_TTL_S regardless of traffic.
+          now = time.monotonic()
+          if _health_cache["ts"] is None or now - _health_cache["ts"] >= _HEALTH_TTL_S:
+              try:
+                  resp = httpx.get(
+                      f"{OURA_BASE}/personal_info",
+                      headers={"Authorization": f"Bearer {OURA_TOKEN}"},
+                      timeout=5,
+                  )
+                  ok = resp.status_code == 200
+              except httpx.HTTPError:
+                  ok = False
+              _health_cache["ts"] = now
+              _health_cache["ok"] = ok
+          ok = _health_cache["ok"]
           return JSONResponse({"status": "ok" if ok else "degraded", "oura_api": ok})
 
 
@@ -554,6 +575,11 @@ configs:
 
 
 
+      def _token_ok(candidate: str) -> bool:
+          """Constant-time comparison to avoid timing side channels."""
+          return hmac.compare_digest(candidate.encode(), AUTH_TOKEN.encode())
+
+
       class TokenPathAuthMiddleware(BaseHTTPMiddleware):
           """Auth via token in URL path: /mcp/<token> or Bearer header.
 
@@ -574,14 +600,14 @@ configs:
 
               if path.startswith("/mcp/"):
                   token = path[len("/mcp/"):]
-                  if token == AUTH_TOKEN:
+                  if _token_ok(token):
                       request.scope["path"] = "/mcp"
                       return await call_next(request)
                   return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
               if path == "/mcp":
                   auth_header = request.headers.get("authorization", "")
-                  if auth_header == f"Bearer {AUTH_TOKEN}":
+                  if auth_header.startswith("Bearer ") and _token_ok(auth_header[7:]):
                       return await call_next(request)
                   return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
@@ -591,4 +617,88 @@ configs:
       app = mcp.http_app(stateless_http=True)
 
       app.add_middleware(TokenPathAuthMiddleware)
+  # Full pip freeze from a verified-working install (pip-audit clean of
+  # reachable vulns as of 2026-08-12). Regenerate after upgrades with:
+  #   docker exec oura-mcp pip freeze
+  oura_requirements:
+    content: |
+      annotated-doc==0.0.5
+      annotated-types==0.8.0
+      anyio==4.14.2
+      attrs==26.1.0
+      Authlib==1.7.2
+      beartype==0.22.9
+      burner-redis==0.1.7
+      cachetools==7.1.7
+      certifi==2026.7.22
+      cffi==2.1.1
+      click==8.4.2
+      cloudpickle==3.1.2
+      cronsim==2.7
+      cryptography==50.0.0
+      cyclopts==4.22.5
+      diskcache==5.6.3
+      dnspython==2.8.0
+      docstring_parser==0.18.0
+      email-validator==2.3.0
+      exceptiongroup==1.3.1
+      fakeredis==2.34.1
+      fastmcp==2.14.7
+      h11==0.16.0
+      httpcore==1.0.9
+      httpx==0.28.1
+      httpx-sse==0.4.3
+      idna==3.18
+      jaraco.classes==3.4.0
+      jaraco.context==6.1.2
+      jaraco.functools==4.6.0
+      jeepney==0.9.0
+      joserfc==1.7.4
+      jsonref==1.1.0
+      jsonschema==4.26.0
+      jsonschema-path==0.5.0
+      jsonschema-specifications==2025.9.1
+      keyring==25.7.0
+      lupa==2.8
+      markdown-it-py==4.2.0
+      mcp==1.29.0
+      mdurl==0.1.2
+      more-itertools==11.1.0
+      openapi-pydantic==0.5.1
+      opentelemetry-api==1.44.0
+      packaging==26.3
+      pathable==0.6.0
+      pathvalidate==3.3.1
+      platformdirs==4.11.2
+      prometheus_client==0.26.0
+      py-key-value-aio==0.3.0
+      py-key-value-shared==0.3.0
+      pycparser==3.0
+      pydantic==2.13.4
+      pydantic-settings==2.15.0
+      pydantic_core==2.46.4
+      pydocket==0.24.1
+      Pygments==2.20.0
+      PyJWT==2.13.0
+      pyperclip==1.11.0
+      python-dotenv==1.2.2
+      python-json-logger==4.1.0
+      python-multipart==0.0.32
+      PyYAML==6.0.3
+      redis==8.1.0
+      referencing==0.37.0
+      rich==15.0.0
+      rich-rst==2.1.0
+      rpds-py==2026.6.3
+      SecretStorage==3.5.0
+      shellingham==1.5.4
+      sortedcontainers==2.4.0
+      sse-starlette==3.4.8
+      starlette==1.6.0
+      typer==0.27.1
+      typing-inspection==0.4.4
+      typing_extensions==4.16.0
+      uncalled-for==0.4.0
+      uvicorn==0.52.1
+      websockets==17.0.1
 networks: {}
